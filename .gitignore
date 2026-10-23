@@ -1,3 +1,25 @@
+# 依赖
 node_modules/
+
+# 日志与系统文件
 *.log
 .DS_Store
+Thumbs.db
+
+# ⛔ 数据文件永不入库（文渊库、导出、会话日志）
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.jsonl
+*.jsonl.zstd
+*.zstd
+exports/
+attachments/
+*.html.gz
+
+# 本地配置与备份
+config.json
+*.bak-*
+*.bak2-*
