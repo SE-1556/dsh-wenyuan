@@ -136,7 +136,7 @@ window.__ModuleLoader__.load({
 
       const open = async (sid) => {
         setDetail({ loading: true })
-        try { setDetail(await api('/session?id=' + encodeURIComponent(sid) + '&limit=400')) }
+        try { setDetail(await api('/session?id=' + encodeURIComponent(sid) + '&limit=3000')) }
         catch (e) { setDetail({ error: String(e.message || e) }) }
       }
 
@@ -195,7 +195,8 @@ window.__ModuleLoader__.load({
           h('input', {
             placeholder: '筛选会话标题…', value: q,
             onChange: (e) => setQ(e.target.value),
-          })),
+          }),
+          h('button', { onClick: () => load() }, '↻')),
         err ? h('div', { className: 'wy-empty' }, '加载失败：' + err) : null,
         rows === null ? h('div', { className: 'wy-load' }, '加载中…') :
           items.length === 0 ? h('div', { className: 'wy-empty' }, '没有匹配的会话') :
