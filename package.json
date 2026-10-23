@@ -1,0 +1,29 @@
+{
+  "name": "dsh-wenyuan",
+  "version": "1.0.0",
+  "description": "文渊 · DSH 会话归档与检索：侧边栏三视图面板（阁/检/鉴）+ 每轮对话自动入库",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["dsh", "dsh-plugin", "session", "archive", "search", "sqlite"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SE-1556/dsh-wenyuan.git"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js"
+  },
+  "files": ["index.js", "client.js", "cordis.patch.yml", "README.md", "LICENSE"],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  },
+  "meta": {
+    "title": "文渊",
+    "description": "会话归档与检索：阁（时间轴）/ 检（全文检索）/ 鉴（洞察），并自动采集每轮对话"
+  }
+}
