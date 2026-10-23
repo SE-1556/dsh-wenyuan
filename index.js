@@ -127,6 +127,20 @@ class Store {
                                WHERE ea.event_id LIKE ?`).all(sid + ':%')
     return { meta, events, images }
   }
+  sessionDialog(sid, limit = 40, offset = 0) {
+    const db = this.db()
+    const TYPES = "('user/message','assistant/message','tool/call','tool/result')"
+    const meta = db.prepare(`SELECT s.*, (SELECT count(*) FROM events e
+                              WHERE e.session_id=s.id AND e.type IN ${TYPES}) events
+                              FROM sessions s WHERE s.id=?`).get(sid)
+    if (!meta) return null
+    const events = db.prepare(`SELECT seq, ts, type, role, text, reasoning,
+                               tool_name, args_json, is_error, exit_code
+                               FROM events
+                               WHERE session_id=? AND type IN ${TYPES}
+                               ORDER BY seq LIMIT ? OFFSET ?`).all(sid, limit, offset)
+    return { meta, events }
+  }
   search(q, limit = 30) {
     const db = this.db()
     const query = (q || '').trim()
@@ -285,8 +299,10 @@ export function apply(ctx, config) {
           },
         },
         render(args, value) {
-          const items = (value && value.items) || []
+          let items = (value && value.items) || []
           if (!items.length) return [{ type: 'text', text: `没有命中「${args.query}」。可以换个词，或去掉修饰语只留核心名词。` }]
+          const NOISE = ['<system-reminder>', 'Current runtime context', 'Updated instructions from:']
+          items = items.filter((it) => !NOISE.some((k) => String(it.text || '').startsWith(k)))
           const lines = [`找到 ${items.length} 条（${args.query}）：`]
           items.forEach((it, i) => {
             lines.push('')
@@ -304,7 +320,13 @@ export function apply(ctx, config) {
         if (!q) throw new Error('query 不能为空')
         const limit = Math.min(Math.max(Number((args && args.limit)) || 10, 1), 50)
         const r = store.search(q, limit)
-        for (const it of r.items) it.ts = fmtTime(it.ts)
+        for (const it of r.items) {
+          it.ts = fmtTime(it.ts)
+          it.text = it.snip_text || ''      // render 读 text，库返回 snip_text
+          it.reasoning = it.snip_rsn || ''
+          delete it.snip_text
+          delete it.snip_rsn
+        }
         return r
       },
     })
@@ -335,8 +357,12 @@ export function apply(ctx, config) {
         },
         render(args, value) {
           if (!value) return [{ type: 'text', text: '没找到匹配的会话。' }]
-          const head = `《${value.title}》 共 ${value.total} 条事件`
-          return [{ type: 'text', text: [head, ...(value.lines || [])].join('\n') }]
+          const shown = (value.lines || []).length
+          const head = `《${value.title}》 对话事件共 ${value.total} 条，本次显示 ${shown} 条`
+          const tail = (value.total > shown && shown > 0)
+            ? [`（还有更多，用 offset=${shown} 继续）`]
+            : []
+          return [{ type: 'text', text: [head, ...(value.lines || []), ...tail].join('\n') }]
         },
       },
       async execute(args) {
@@ -352,10 +378,13 @@ export function apply(ctx, config) {
         }
         if (!meta) return null
         if (meta.ambiguous) return { title: '匹配到多个会话，请给更长的 id 前缀', total: 0, lines: meta.ambiguous, lines_only: true }
-        const d = store.session(meta.id, limit, offset)
+        const d = store.sessionDialog(meta.id, limit, offset)
         if (!d) return null
         const lines = []
+        const NOISE = ['<system-reminder>', 'Current runtime context', 'Updated instructions from:']
         for (const e of d.events) {
+          const txt = String(e.text || '')
+          if (NOISE.some((k) => txt.startsWith(k))) continue   // 系统注入，跳过
           const who = e.role === 'user' ? '用户' : e.role === 'assistant' ? 'AI' : (e.tool_name || '工具')
           lines.push(`【${who}】${e.type}${e.exit_code != null ? ' exit=' + e.exit_code : ''}`)
           if (e.reasoning) lines.push(`  ⟨思考⟩ ${String(e.reasoning).replace(/\s+/g, ' ').slice(0, 400)}`)
