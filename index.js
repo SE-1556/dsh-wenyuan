@@ -18,7 +18,7 @@ import { join } from 'node:path'
 export const name = 'dsh-wenyuan'
 
 // Cordis 要求先声明才能访问 ctx.webServer（否则属性访问本身抛错）
-export const inject = ['webServer']
+export const inject = ['webServer', 'tools']
 
 const DEFAULTS = {
   configPath: '/root/.wenyuan/config.json',
@@ -177,6 +177,13 @@ class Store {
     const depths = db.prepare('SELECT depth, count(*) c FROM sessions GROUP BY depth ORDER BY depth').all()
     return { daily, hourly, bytype, depths }
   }
+  findSession(prefix) {
+    const db = this.db()
+    const rows = db.prepare("SELECT id, title FROM sessions WHERE id LIKE ? LIMIT 2").all(prefix + '%')
+    if (rows.length === 1) return rows[0]
+    if (rows.length > 1) return { ambiguous: rows.map(r => r.id) }
+    return null
+  }
   attachmentPath(sha) {
     if (!/^[0-9a-f]{64}$/.test(sha)) return null
     return join(this.root, 'attachments', sha.slice(0, 2), sha)
@@ -231,7 +238,139 @@ export function apply(ctx, config) {
     return () => { try { off?.() } catch {} }
   })
 
-  /* ── 2. 自动采集 ── */
+  /* ── 2. Agent 工具（让我能主动查历史） ── */
+  ctx.effect(() => {
+    if (!ctx.tools) { log('tools 服务不可用，跳过工具注册'); return () => {} }
+
+    const fmtTime = (ts) => {
+      if (!ts) return '—'
+      const d = new Date(ts + 8 * 3600 * 1000)
+      const p = (n) => String(n).padStart(2, '0')
+      return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`
+    }
+
+    // ── 检索 ──
+    const offSearch = ctx.tools.register({
+      name: 'wenyuan_search',
+      description:
+        '检索历史会话归档（文渊库），包含用户的输入、AI 的正文与思考过程、执行过的命令。'
+        + '当需要回忆"上次是怎么解决的""之前定过什么方案""用户以前提过什么"时优先调用它，'
+        + '比凭记忆猜更可靠。中文/英文/单字均可检索。',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: '检索词。中文两字以上最准（如"数据库""亿纬"），英文按词匹配，单字也支持。' },
+          limit: { type: 'number', description: '返回条数，默认 10，最大 50。' },
+        },
+        required: ['query'],
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            total: { type: 'number' },
+            items: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  session_title: { type: 'string' },
+                  ts: { type: 'string' },
+                  role: { type: 'string' },
+                  text: { type: 'string' },
+                  reasoning: { type: 'string' },
+                },
+              },
+            },
+          },
+        },
+        render(args, value) {
+          const items = (value && value.items) || []
+          if (!items.length) return [{ type: 'text', text: `没有命中「${args.query}」。可以换个词，或去掉修饰语只留核心名词。` }]
+          const lines = [`找到 ${items.length} 条（${args.query}）：`]
+          items.forEach((it, i) => {
+            lines.push('')
+            lines.push(`${i + 1}. [${it.ts}]《${(it.session_title || '').slice(0, 24)}》${it.role === 'user' ? '【用户】' : '【AI】'}`)
+            if (it.text) lines.push(`   ${String(it.text).replace(/\s+/g, ' ').slice(0, 260)}`)
+            if (it.reasoning) lines.push(`   ⟨思考⟩ ${String(it.reasoning).replace(/\s+/g, ' ').slice(0, 200)}`)
+          })
+          lines.push('')
+          lines.push('需要看完整上下文时，用 wenyuan_read 传会话标题或 id 前缀。')
+          return [{ type: 'text', text: lines.join('\n') }]
+        },
+      },
+      async execute(args) {
+        const q = String((args && args.query) || '').trim()
+        if (!q) throw new Error('query 不能为空')
+        const limit = Math.min(Math.max(Number((args && args.limit)) || 10, 1), 50)
+        const r = store.search(q, limit)
+        for (const it of r.items) it.ts = fmtTime(it.ts)
+        return r
+      },
+    })
+
+    // ── 读会话 ──
+    const offRead = ctx.tools.register({
+      name: 'wenyuan_read',
+      description:
+        '读取文渊库里某个会话的内容（含思考过程与命令轨迹）。'
+        + '先用 wenyuan_search 找到会话，再用本工具看上下文。也支持传用户给出的会话标题关键词。',
+      parameters: {
+        type: 'object',
+        properties: {
+          session: { type: 'string', description: '会话 id 前缀，或标题关键词。' },
+          limit: { type: 'number', description: '最多返回多少条事件，默认 40，最大 300。' },
+          offset: { type: 'number', description: '从第几条开始（默认 0），用于分段看长会话。' },
+        },
+        required: ['session'],
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            title: { type: 'string' },
+            total: { type: 'number' },
+            lines: { type: 'array', items: { type: 'string' } },
+          },
+        },
+        render(args, value) {
+          if (!value) return [{ type: 'text', text: '没找到匹配的会话。' }]
+          const head = `《${value.title}》 共 ${value.total} 条事件`
+          return [{ type: 'text', text: [head, ...(value.lines || [])].join('\n') }]
+        },
+      },
+      async execute(args) {
+        const key = String((args && args.session) || '').trim()
+        if (!key) throw new Error('session 不能为空')
+        const limit = Math.min(Math.max(Number((args && args.limit)) || 40, 1), 300)
+        const offset = Math.max(Number((args && args.offset)) || 0, 0)
+        let meta = store.findSession(key)
+        if (!meta) {
+          // 退化为标题匹配
+          const all = store.sessions({ limit: 300 }).items
+          meta = all.find((s) => (s.title || '').includes(key))
+        }
+        if (!meta) return null
+        if (meta.ambiguous) return { title: '匹配到多个会话，请给更长的 id 前缀', total: 0, lines: meta.ambiguous, lines_only: true }
+        const d = store.session(meta.id, limit, offset)
+        if (!d) return null
+        const lines = []
+        for (const e of d.events) {
+          const who = e.role === 'user' ? '用户' : e.role === 'assistant' ? 'AI' : (e.tool_name || '工具')
+          lines.push(`【${who}】${e.type}${e.exit_code != null ? ' exit=' + e.exit_code : ''}`)
+          if (e.reasoning) lines.push(`  ⟨思考⟩ ${String(e.reasoning).replace(/\s+/g, ' ').slice(0, 400)}`)
+          if (e.args_json) lines.push(`  ⟨命令⟩ ${String(e.args_json).replace(/\s+/g, ' ').slice(0, 300)}`)
+          if (e.text) lines.push(`  ${String(e.text).replace(/\s+/g, ' ').slice(0, 600)}`)
+        }
+        return { title: (d.meta && d.meta.title) || meta.title || '', total: (d.meta && d.meta.events) || 0, lines }
+      },
+    })
+
+    log('已注册工具 wenyuan_search / wenyuan_read')
+    return () => { try { offSearch?.() } catch {} try { offRead?.() } catch {} }
+  })
+
+  /* ── 3. 自动采集 ── */
   if (cfg.autoIngest) {
     let timer = null, running = false, pending = false
     const run = () => {
